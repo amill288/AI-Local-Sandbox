@@ -10,6 +10,9 @@ import traceback
 import subprocess, re
 from transformers import AutoModel, AutoTokenizer
 import numpy as np
+import hashlib
+from dataclasses import dataclass, field
+from collections import OrderedDict
 
 
 # Keep history bounded to avoid VRAM/latency blowups
@@ -234,6 +237,19 @@ def wav_reverse(in_wav: str) -> str:
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
 # -----------------------------
 # Chat function 
 # -----------------------------
@@ -271,7 +287,7 @@ def chat_step(chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume
     # -------- Input cleanup --------
     user_text = (user_text or "").strip()
     if not user_text and user_image is None:
-        return _as_messages(chat_ui), (msgs_state or []), "", None
+        return _as_messages(chat_ui), (msgs_state or []), "", None, last_audio_state, is_reversed_state
 
     # Normalize image coming from Gradio (can be PIL or np.ndarray)
     pil_img = None
@@ -285,7 +301,8 @@ def chat_step(chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume
             chat_ui_msgs = _as_messages(chat_ui)
             chat_ui_msgs.append({"role": "user", "content": user_text or "[image]"})
             chat_ui_msgs.append({"role": "assistant", "content": "⚠️ Unsupported image type received from UI."})
-            return chat_ui_msgs, (msgs_state or []), "", None
+            return chat_ui_msgs, msgs_state, "", None, last_audio_state, is_reversed_state
+
 
         pil_img = pil_img.convert("RGB")
 
@@ -362,7 +379,8 @@ def chat_step(chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume
         chat_ui_msgs = _as_messages(chat_ui)
         chat_ui_msgs.append({"role": "user", "content": ui_user_content})
         chat_ui_msgs.append({"role": "assistant", "content": "⚠️ GPU OOM. Try a smaller image or shorter prompt."})
-        return chat_ui_msgs, msgs_state, "", None
+        return chat_ui_msgs, msgs_state, "", None, last_audio_state, is_reversed_state
+
 
     except RuntimeError as e:
         # rollback last user message
@@ -377,12 +395,13 @@ def chat_step(chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume
                 "role": "assistant",
                 "content": "⚠️ Vision dtype mismatch. This almost always happens when the image wasn't passed as a PIL RGB image in the model's expected format ([image, text])."
             })
-            return chat_ui_msgs, msgs_state, "", None
+            return chat_ui_msgs, msgs_state, "", None, last_audio_state, is_reversed_state
+
 
         chat_ui_msgs = _as_messages(chat_ui)
         chat_ui_msgs.append({"role": "user", "content": ui_user_content})
         chat_ui_msgs.append({"role": "assistant", "content": f"⚠️ Runtime error: {msg}"})
-        return chat_ui_msgs, msgs_state, "", None
+        return chat_ui_msgs, msgs_state, "", None, last_audio_state, is_reversed_state
 
     except Exception as e:
         # rollback last user message
@@ -392,7 +411,8 @@ def chat_step(chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume
         chat_ui_msgs = _as_messages(chat_ui)
         chat_ui_msgs.append({"role": "user", "content": ui_user_content})
         chat_ui_msgs.append({"role": "assistant", "content": f"⚠️ Internal error: {type(e).__name__}({e})"})
-        return chat_ui_msgs, msgs_state, "", None
+        return chat_ui_msgs, msgs_state, "", None, last_audio_state, is_reversed_state
+
 
 
 
@@ -449,7 +469,13 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
     chat_ui = gr.Chatbot(height=420)
 
     with gr.Row():
-        user_text = gr.Textbox(label="Message", placeholder="Type here...", scale=3, lines=1)
+        with gr.Column():
+            gr.Markdown("## Voice input (Speech → Text)")
+            with gr.Row():
+                mic = gr.Audio(sources=["microphone"], type="filepath", label="Record voice")
+                #transcribe_btn = gr.Button("Transcribe → Put into message box")
+
+            user_text = gr.Textbox(label="Message", placeholder="Type here...", scale=3, lines=1)
         user_image = gr.Image(label="Optional image", type="pil", scale=2)
 
    
@@ -494,21 +520,22 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
         # Horizontal line separator
          gr.HTML("<hr style='border: 1px solid #bbb; margin: 80px 0;'>")
 
-
+    """
     gr.Markdown("## Voice input (Speech → Text)")
     with gr.Row():
         mic = gr.Audio(sources=["microphone"], type="filepath", label="Record voice")
         transcribe_btn = gr.Button("Transcribe → Put into message box")
-
+    """
     def _clear():
         chat_ui = []
         msgs_state = []
         user_text = ""
         out_audio = None
         user_image = None
+        mic = None
         last_audio_state = None
         is_reversed_state = None
-        return chat_ui, msgs_state, user_text, out_audio, user_image, last_audio_state, is_reversed_state
+        return chat_ui, msgs_state, user_text, out_audio, user_image, mic, last_audio_state, is_reversed_state
     
     def _clear_img():
         gen_img_out = None
@@ -529,12 +556,40 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
         outputs=[chat_ui, msgs_state, user_text, out_audio, last_audio_state, is_reversed_state],
     )
 
-
+    """
     transcribe_btn.click(
         fn=do_transcribe,
         inputs=[mic],
         outputs=[user_text],
     )
+    """
+
+    mic.change(
+        fn=do_transcribe,
+        inputs=[mic],
+        outputs=[user_text],
+    ).then(
+        fn=chat_step,
+        inputs=[
+            chat_ui,
+            msgs_state,
+            user_text,
+            user_image,
+            speak_back,
+            tts_volume,
+            reverse_after,
+            last_audio_state
+        ],
+        outputs=[
+            chat_ui,
+            msgs_state,
+            user_text,
+            out_audio,
+            last_audio_state,
+            is_reversed_state
+        ],
+    )
+
 
     gen_img_btn.click(
         fn=do_generate_image,
@@ -552,7 +607,7 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
     clear_btn.click(
         fn=_clear,
         inputs=[],
-        outputs=[chat_ui, msgs_state, user_text, out_audio, user_image, last_audio_state, is_reversed_state],
+        outputs=[chat_ui, msgs_state, user_text, out_audio, user_image, mic, last_audio_state, is_reversed_state],
     )
 
     clear_btn_img.click(
@@ -562,14 +617,12 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
     )
 
 
-    
 
     reverse_btn.click(
         fn=toggle_reverse_audio,
         inputs=[last_audio_state, is_reversed_state],
         outputs=[out_audio, is_reversed_state],
     )
-
 
 
 
