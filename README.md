@@ -51,6 +51,7 @@ Software
 ## Installation
 
 #### From Windows CMD:
+* Note: If this hangs, press CNTL+C and rerun. * 
 ```
 wsl --install -d Ubuntu-24.04 --name MiniCPM-demo
 ```
