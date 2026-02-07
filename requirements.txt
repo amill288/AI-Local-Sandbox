@@ -1,39 +1,26 @@
-# Piper
-pathvalidate
-piper-tts
+# Core compatibility pins (critical for MiniCPM trust_remote_code + device_map="auto")
+transformers==4.51.0
+accelerate==1.12.0
+tokenizers==0.21.4
+safetensors==0.7.0
+huggingface_hub==0.36.2
 
+# UI (pin to working)
+gradio==6.5.1
 
-# Core ML / HF
-transformers>=4.51
-accelerate>=1.12.0
-safetensors>=0.7.0
-tokenizers>=0.21.4
-
-# UI
-gradio>=6.5
-
-# Images & arrays
+# Rest can stay flexible
 numpy
-pillow>=10.4.0
-
-# Audio I/O + TTS helpers
+pillow==10.4.0
 soundfile>=0.13.0
 pydub>=0.25.1
-piper-tts
-pathvalidate
-
-# Speech-to-text (CPU)
-faster-whisper>=1.2.0
-ctranslate2>=4.7.0
-av>=16.1.0
-
-# Optional image generation
-diffusers>=0.36.0
-
-# Utilities
-tqdm>=4.67.3
+piper-tts==1.4.1
+pathvalidate==3.3.1
+faster-whisper==1.2.1
+ctranslate2==4.7.1
+av==16.1.0
+diffusers==0.36.0
+tqdm==4.67.3
 regex
 requests
-python-dotenv>=1.2.0
-
-bitsandbytes>=0.49.0
+python-dotenv==1.2.1
+bitsandbytes==0.49.1
