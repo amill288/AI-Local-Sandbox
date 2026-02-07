@@ -111,12 +111,11 @@ Feel free to switch the wget to a different `piper` voice model.
 
 ## Running the App
 ```
+cd ~/MiniCPM
 python minicpm.py
 ```
-The Gradio interface will launch on:
+Enter into a browser window the address the Gradio interface will launch on:
 ```
-# Enter this in browser:
-
 http://localhost:7860
 ```
 <br><br>
