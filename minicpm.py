@@ -16,7 +16,10 @@ from collections import OrderedDict
 import hashlib
 from dataclasses import dataclass, field
 from collections import OrderedDict
-
+import re
+import wave
+from queue import Queue, Empty
+from threading import Thread, Event
 
 # Keep history bounded to avoid VRAM/latency blowups
 MAX_TURNS = 12
@@ -268,7 +271,7 @@ def transcribe_audio(audio_path: str) -> str:
 # Voice: Text-to-Speech (CPU)
 # -----------------------------
 
-# Path to the LibriTTS voice you downloaded
+# Path to the LibriTTS voice 
 PIPER_VOICE = os.path.expanduser("~/piper_voices/libritts_r_medium/en_US-libritts_r-medium.onnx")
 
 def tts_to_wav(text: str) -> str:
@@ -298,6 +301,264 @@ def clean_for_tts(text: str) -> str:
     text = re.sub(r"^\s*[-•*]\s+", "", text, flags=re.MULTILINE)
 
     return text.strip()
+
+
+
+
+
+
+def should_speak(buf: str) -> bool:
+    s = (buf or "").strip()
+    if len(s) >= 180:
+        return True
+    return s.endswith((".", "!", "?"))
+
+
+
+
+
+
+
+
+def chunk_duration_s(sr, chunk: np.ndarray) -> float:
+    return float(len(chunk)) / float(sr)
+
+
+def wav_iter_chunks(wav_path: str, chunk_frames: int = 4096):
+    """
+    Yield (sr, float32_mono_chunk) from a wav file, chunked for streaming.
+    float32 range [-1, 1]
+    """
+    with wave.open(wav_path, "rb") as wf:
+        sr = wf.getframerate()
+        nchan = wf.getnchannels()
+        sampw = wf.getsampwidth()
+
+        if sampw != 2:
+            raise ValueError(f"Expected 16-bit PCM wav. Got sample_width={sampw}")
+
+        while True:
+            raw = wf.readframes(chunk_frames)
+            if not raw:
+                break
+            audio_i16 = np.frombuffer(raw, dtype=np.int16)
+
+            if nchan > 1:
+                audio_i16 = audio_i16.reshape(-1, nchan).mean(axis=1).astype(np.int16)
+
+            audio_f32 = (audio_i16.astype(np.float32) / 32768.0)
+            yield sr, audio_f32
+         
+
+
+def wait_for_file_stable(path: str, timeout_s: float = 5.0, stable_checks: int = 3, poll_s: float = 0.02):
+    """
+    Wait until file exists and size stops changing for stable_checks polls.
+    """
+    t0 = time.time()
+    last = -1
+    stable = 0
+    while time.time() - t0 < timeout_s:
+        try:
+            sz = os.path.getsize(path)
+        except OSError:
+            time.sleep(poll_s)
+            continue
+
+        if sz > 0 and sz == last:
+            stable += 1
+            if stable >= stable_checks:
+                return True
+        else:
+            stable = 0
+            last = sz
+
+        time.sleep(poll_s)
+    return False
+
+
+
+
+def load_wav_full_as_np(path: str):
+    with wave.open(path, "rb") as wf:
+        sr = wf.getframerate()
+        nchan = wf.getnchannels()
+        sampw = wf.getsampwidth()
+        if sampw != 2:
+            raise ValueError(f"Expected 16-bit PCM wav. Got {sampw}")
+
+        raw = wf.readframes(wf.getnframes())
+        audio = np.frombuffer(raw, dtype=np.int16)
+
+        if nchan > 1:
+            audio = audio.reshape(-1, nchan).mean(axis=1).astype(np.int16)
+
+        audio_f32 = audio.astype(np.float32) / 32768.0
+        return sr, audio_f32
+
+
+
+class TTSAudioStreamer:
+    def __init__(self, chunk_frames: int = 24000):
+        self.chunk_frames = int(chunk_frames)
+        self.job_q = Queue(maxsize=8)
+        self.audio_q = Queue(maxsize=128)
+        self.stop_evt = Event()
+        self.worker = None
+
+    def start(self):
+        if self.worker and self.worker.is_alive():
+            return
+        self.stop_evt.clear()
+        self.worker = Thread(target=self._run, daemon=True)
+        self.worker.start()
+
+    def stop(self):
+        self.stop_evt.set()
+
+    def submit_text(self, text: str, volume: float = 1.0):
+        self.job_q.put({
+            "text": text,
+            "volume": float(volume),
+        })
+
+    def try_get_audio(self):
+        try:
+            return self.audio_q.get_nowait()
+        except Empty:
+            return None
+
+    def _run(self):
+        while not self.stop_evt.is_set():
+            try:
+                job = self.job_q.get(timeout=0.05)
+            except Empty:
+                continue
+
+            text = job["text"].strip()
+            if not text:
+                continue
+
+            volume = job["volume"]
+
+
+            wav_path = tts_to_wav(clean_for_tts(text))
+            wait_for_file_stable(wav_path)
+            
+            sr, audio = load_wav_full_as_np(wav_path)
+
+            chunk_frames = self.chunk_frames
+            i = 0
+            while i < len(audio) and not self.stop_evt.is_set():
+                chunk = audio[i:i+chunk_frames]
+                self.audio_q.put((sr, chunk))
+                i += chunk_frames
+
+
+    
+def save_np_to_wav(audio_f32: np.ndarray, sr: int, path: str | None = None) -> str:
+    audio_f32 = np.clip(audio_f32, -1.0, 1.0)
+    audio_i16 = (audio_f32 * 32767.0).astype(np.int16)
+
+    if path is None:
+        path = f"/tmp/tts_stream_{int(time.time()*1000)}.wav"
+
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(int(sr))
+        wf.writeframes(audio_i16.tobytes())
+    return path
+
+
+def wav_duration_s(path: str) -> float:
+    with wave.open(path, "rb") as wf:
+        frames = wf.getnframes()
+        sr = wf.getframerate()
+        return frames / float(sr)
+
+
+class TTSWavQueue:
+    SENTINEL = ("__END__", 0.0)
+    def __init__(self, max_ready: int = 16):
+        self.job_q = Queue(maxsize=64)       # text jobs
+        self.ready_q = Queue(maxsize=max_ready)  # wav paths ready to play
+        self.stop_evt = Event()
+        self.worker = None
+
+    def start(self):
+        if self.worker and self.worker.is_alive():
+            return
+        self.stop_evt.clear()
+        self.worker = Thread(target=self._run, daemon=True)
+        self.worker.start()
+
+    def stop(self):
+        self.stop_evt.set()
+
+    def submit_text(self, text: str, volume: float):
+        self.job_q.put((text, float(volume)))
+
+    def try_get_ready(self):
+        try:
+            return self.ready_q.get_nowait()
+        except Empty:
+            return None
+    
+    def end_turn(self):
+        self.job_q.put(self.SENTINEL)
+
+    def _run(self):
+        while not self.stop_evt.is_set():
+            try:
+                text, vol = self.job_q.get(timeout=0.05)
+            except Empty:
+                continue
+
+            if text == "__END__":
+                # mark end-of-turn in ready queue too
+                self.ready_q.put("__END__")
+                continue
+
+            wav_path = tts_to_wav(clean_for_tts(text))
+            wav_path = wav_apply_volume_pcm16(wav_path, vol)
+            self.ready_q.put(wav_path)
+
+    def clear_queues(self):
+        while True:
+            try: self.job_q.get_nowait()
+            except Empty: break
+        while True:
+            try: self.ready_q.get_nowait()
+            except Empty: break
+
+
+
+
+
+
+def concat_wavs(wav_paths, out_path=None):
+    if not wav_paths:
+        return None
+    if out_path is None:
+        out_path = f"/tmp/tts_concat_{int(time.time()*1000)}.wav"
+
+    with wave.open(wav_paths[0], "rb") as w0:
+        params = w0.getparams()
+
+    with wave.open(out_path, "wb") as out:
+        out.setparams(params)
+        for p in wav_paths:
+            with wave.open(p, "rb") as w:
+                # basic safety: ensure compatible format
+                if w.getparams() != params:
+                    raise ValueError("WAV format mismatch; cannot concat safely.")
+                out.writeframes(w.readframes(w.getnframes()))
+    return out_path
+
+
+
+
 
 # -----------------------------
 # OPTIONAL: Image generation (separate model)
@@ -423,29 +684,25 @@ def refine_image(img: Image.Image, prompt: str, steps: int = 20, strength: float
 def _unique_wav_path(prefix="tts"):
     return os.path.join("/tmp", f"{prefix}_{int(time.time()*1000)}.wav")
 
-def wav_apply_volume(in_wav: str, volume: float) -> str:
-    """
-    Returns a new WAV with audio scaled by `volume`.
-    volume=1.0 unchanged, 0.5 half as loud, 2.0 twice as loud (may clip).
-    """
-    import soundfile as sf
 
+def wav_apply_volume_pcm16(in_path: str, volume: float) -> str:
     volume = float(volume)
-    if volume <= 0:
-        volume = 0.0001
+    out_path = f"/tmp/tts_vol_{int(time.time()*1000)}.wav"
 
-    audio, sr = sf.read(in_wav, always_2d=False)  # audio shape: (n,) or (n, ch)
+    with wave.open(in_path, "rb") as r:
+        params = r.getparams()
+        if params.sampwidth != 2:
+            raise ValueError(f"Expected PCM16 wav (sampwidth=2), got {params.sampwidth}")
+        frames = r.readframes(r.getnframes())
 
-    # Scale
-    audio = audio * volume
+    audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32)
+    audio = np.clip(audio * volume, -32768, 32767).astype(np.int16)
 
-    # Prevent clipping: clamp to [-1, 1] for float WAVs
-    # soundfile may give float32/float64; clamp is safe either way.
-    audio = np.clip(audio, -1.0, 1.0)
+    with wave.open(out_path, "wb") as w:
+        w.setparams(params)   # preserves sr/channels/etc
+        w.writeframes(audio.tobytes())
 
-    out_wav = _unique_wav_path("tts_vol")
-    sf.write(out_wav, audio, sr)
-    return out_wav
+    return out_path
 
 def wav_reverse(in_wav: str) -> str:
     """
@@ -464,6 +721,68 @@ def wav_reverse(in_wav: str) -> str:
     out_wav = _unique_wav_path("tts_rev")
     sf.write(out_wav, audio_rev, sr)
     return out_wav
+
+
+def debug_params(path: str):
+    import wave
+    with wave.open(path, "rb") as w:
+        print(path, w.getparams())
+
+def _read_wav_as_f32_mono(path: str):
+    with wave.open(path, "rb") as wf:
+        sr = wf.getframerate()
+        nchan = wf.getnchannels()
+        sw = wf.getsampwidth()
+        if sw != 2:
+            raise ValueError(f"{path}: expected PCM16 (sampwidth=2), got {sw}")
+        raw = wf.readframes(wf.getnframes())
+
+    x = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    if nchan > 1:
+        x = x.reshape(-1, nchan).mean(axis=1)
+    return sr, x
+
+def _resample_linear(x: np.ndarray, sr_in: int, sr_out: int):
+    if sr_in == sr_out:
+        return x
+    ratio = sr_out / float(sr_in)
+    n_out = int(round(len(x) * ratio))
+    if n_out <= 1:
+        return x[:1]
+    t_in = np.linspace(0.0, 1.0, num=len(x), endpoint=False)
+    t_out = np.linspace(0.0, 1.0, num=n_out, endpoint=False)
+    return np.interp(t_out, t_in, x).astype(np.float32)
+
+def concat_wavs_flexible(wav_paths, out_path=None):
+    if not wav_paths:
+        return None
+    if out_path is None:
+        out_path = f"/tmp/tts_concat_{int(time.time()*1000)}.wav"
+
+    # target SR = first clip SR
+    sr0, x0 = _read_wav_as_f32_mono(wav_paths[0])
+    chunks = [x0]
+
+    for p in wav_paths[1:]:
+        sr, x = _read_wav_as_f32_mono(p)
+        x = _resample_linear(x, sr, sr0)
+        chunks.append(x)
+
+    full = np.concatenate(chunks, axis=0)
+    full = np.clip(full, -1.0, 1.0)
+    audio_i16 = (full * 32767.0).astype(np.int16)
+
+    with wave.open(out_path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(int(sr0))
+        wf.writeframes(audio_i16.tobytes())
+
+    return out_path
+
+
+
+
 
 
 
@@ -571,7 +890,7 @@ def chat_step(chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume
 
         if speak_back:
             normal_path = tts_to_wav(clean_for_tts(response_text))
-            normal_path = wav_apply_volume(normal_path, tts_volume_val)
+            normal_path = wav_apply_volume_pcm16(normal_path, tts_volume_val)
 
             audio_path = normal_path  # default playback is normal
             new_last_audio = normal_path
@@ -640,10 +959,10 @@ def chat_step(chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume
 
 def chat_step_stream(chat_ui, mm_state: MMState, user_text, user_image,
                      speak_back, tts_volume_val, reverse_after,
-                     last_audio_state, is_reversed_state):
-    if mm_state is None:
-        mm_state = MMState()
-
+                     last_audio_state, is_reversed_state, tts_queue_state, playing_until_state):
+    audio_accum = []   # list of np.float32 chunks
+ 
+    
     # ---- UI normalize ----
     def _as_messages(x):
         if x is None:
@@ -660,7 +979,9 @@ def chat_step_stream(chat_ui, mm_state: MMState, user_text, user_image,
 
     chat_ui_msgs = _as_messages(chat_ui)
 
-    # ---- image normalize (your existing logic) ----
+
+
+     # ---- Check for an actual input ----
     pil_img = None
     if user_image is not None:
         if isinstance(user_image, np.ndarray):
@@ -670,8 +991,38 @@ def chat_step_stream(chat_ui, mm_state: MMState, user_text, user_image,
 
     user_text = (user_text or "").strip()
     if not user_text and pil_img is None:
-        yield chat_ui_msgs, mm_state, "", None, last_audio_state, is_reversed_state
+        #yield chat_ui_msgs, mm_state, "", None, None, last_audio_state, is_reversed_state, tts_queue_state, playing_until_state
         return
+
+
+
+    # ---- now it's a real turn ----
+    if mm_state is None:
+        mm_state = MMState()
+
+    if tts_queue_state is None:
+        tts_queue_state = TTSWavQueue()
+        tts_queue_state.start()
+    else:
+        tts_queue_state.clear_queues()
+
+    playing_until_state = 0.0
+    is_reversed_state = False
+
+    yield (
+        chat_ui_msgs,
+        mm_state,
+        "",
+        gr.update(value=None, visible=False),
+        gr.update(value=None, visible=True),
+        last_audio_state,
+        False,
+        tts_queue_state,
+        playing_until_state
+    )
+
+
+
 
     ui_user_content = user_text if user_text else ("[image]" if pil_img is not None else "")
     chat_ui_msgs.append({"role": "user", "content": ui_user_content})
@@ -679,34 +1030,78 @@ def chat_step_stream(chat_ui, mm_state: MMState, user_text, user_image,
     # Add placeholder assistant message we will update as we stream
     chat_ui_msgs.append({"role": "assistant", "content": ""})
 
+
     # ---- stream from agent ----
     partial = ""
+    spoken_upto = 0
+
     for partial in agent.stream_chat(mm_state, user_text=user_text, user_image=pil_img):
         chat_ui_msgs[-1]["content"] = partial
-        yield chat_ui_msgs, mm_state, "", None, last_audio_state, is_reversed_state
 
-    # ---- Optional: do TTS once at the end (avoid re-speaking partials) ----
-    audio_path = None
-    new_last_audio = last_audio_state
-    new_is_reversed = is_reversed_state
+        if speak_back and len(partial) > spoken_upto:
+            pending = partial[spoken_upto:]
+            backlog = tts_queue_state.job_q.qsize() + tts_queue_state.ready_q.qsize()
+            if backlog < 2 and should_speak(pending):
+                tts_queue_state.submit_text(pending, tts_volume_val)
+                spoken_upto = len(partial)
 
-    tts_volume_val = 1.0 if tts_volume_val is None else float(tts_volume_val)
-    reverse_after = bool(reverse_after) if reverse_after is not None else False
+        now = time.time()
+        out_audio_val = None
+        if speak_back and now >= float(playing_until_state):
+            wav_path = tts_queue_state.try_get_ready()
+            if wav_path:
+                out_audio_val = wav_path
+                audio_accum.append(out_audio_val)
+                debug_params(out_audio_val)
+                dur = wav_duration_s(out_audio_val)
+                playing_until_state = now + dur + 0.08
+                last_audio_state = out_audio_val
+                is_reversed_state = False
 
-    if speak_back and partial.strip():
-        normal_path = tts_to_wav(clean_for_tts(partial))
-        normal_path = wav_apply_volume(normal_path, tts_volume_val)
-        audio_path = normal_path
-        new_last_audio = normal_path
-        new_is_reversed = False
+        yield chat_ui_msgs, mm_state, "", None, out_audio_val, last_audio_state, is_reversed_state, tts_queue_state, playing_until_state
 
-        if reverse_after:
-            audio_path = wav_reverse(normal_path)
-            new_is_reversed = True
+    # ---- flush tail text to TTS (unthrottled) ----
+    if speak_back and len(partial) > spoken_upto:
+        tail = partial[spoken_upto:].strip()
+        if tail:
+            tts_queue_state.submit_text(tail, tts_volume_val)
+            spoken_upto = len(partial)
 
-    yield chat_ui_msgs, mm_state, "", audio_path, new_last_audio, new_is_reversed
+    # mark end of this response
+    if speak_back:
+        tts_queue_state.end_turn()
+
+    # ---- drain remaining audio after text stops ----
+    t0 = time.time()
+    while speak_back and (time.time() - t0) < 30.0:
+        now = time.time()
+        out_audio_val = None
+
+        if now >= float(playing_until_state):
+            item = tts_queue_state.try_get_ready()
+            if not item:
+                time.sleep(0.02)
+                continue
+
+            if item == "__END__":
+                break
+
+            wav_path = item
+            out_audio_val = wav_path
+            dur = wav_duration_s(wav_path)
+            playing_until_state = now + dur + 0.08
+            last_audio_state = wav_path
+            is_reversed_state = False
+
+        yield chat_ui_msgs, mm_state, "", None, out_audio_val, last_audio_state, is_reversed_state, tts_queue_state, playing_until_state
+        time.sleep(0.02)
 
 
+ 
+    full_path = concat_wavs_flexible(audio_accum)
+    last_audio_state = full_path or last_audio_state
+    is_reversed_state = False
+    yield chat_ui_msgs, mm_state, "", None,None, last_audio_state, is_reversed_state, tts_queue_state, playing_until_state
 
 
 
@@ -719,7 +1114,7 @@ def do_transcribe(mic_audio):
     mic_audio from Gradio Audio: (sr, np.ndarray) or a filepath depending on type.
     We'll use type="filepath" below for simplicity.
     """
-    if mic_audio is None:
+    if not mic_audio:
         return ""
     return transcribe_audio(mic_audio)
 
@@ -746,6 +1141,24 @@ def toggle_reverse_audio(last_audio_path, is_reversed):
         rev_path = wav_reverse(last_audio_path)
         return rev_path, True
 
+def toggle_reverse_audio_ui(last_audio_path, is_reversed):
+    if not last_audio_path:
+        return gr.update(), gr.update(), is_reversed  # no-op
+
+    if is_reversed:
+        # go back to normal (file)
+        return (
+            gr.update(value=last_audio_path, visible=True),
+            gr.update(visible=False),  # hide streaming player
+            False
+        )
+    else:
+        rev_path = wav_reverse(last_audio_path)
+        return (
+            gr.update(value=rev_path, visible=True),
+            gr.update(visible=False),
+            True
+        )
 
 # -----------------------------
 # Gradio UI
@@ -796,9 +1209,11 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
         
   
 
-    out_audio = gr.Audio(label="Assistant voice", autoplay=True)
-    #out_audio_stream = gr.Audio(streaming=True, autoplay=True, label="Streaming TTS")
-  
+    out_audio = gr.Audio(label="Assistant voice", autoplay=True, visible=False)
+    out_audio_stream = gr.Audio(streaming=True, autoplay=True, label="Streaming TTS", visible=True)
+
+
+
 
     with gr.Blocks():
         # Horizontal line separator
@@ -829,8 +1244,17 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
          gr.HTML("<hr style='border: 1px solid #bbb; margin: 80px 0;'>")
 
 
-    last_audio_state = gr.State(None)         # path to the most recent NORMAL audio
-    is_reversed_state = gr.State(False)       # whether we're currently playing reversed
+
+
+    # State Changes 
+    # -----------------------------------
+    last_audio_state = gr.State(None)        
+    is_reversed_state = gr.State(False)       
+    tts_queue_state = gr.State(None)   
+    playing_until_state = gr.State(0.0) 
+    # -----------------------------------
+
+
 
     gr.Markdown("## Optional: Image generation (Text → Image)")
     with gr.Row():
@@ -849,28 +1273,6 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
     gen_img_out = gr.Image(label="Generated image")
 
 
-    """
-    with gr.Row():
-        sd_steps = gr.Slider(1, 8, value=4, step=1, label="Draft steps (Turbo)")
-        sd_w = gr.Dropdown([384, 512, 640, 768], value=512, label="Width")
-        sd_h = gr.Dropdown([384, 512, 640, 768], value=512, label="Height")
-
-    with gr.Row():
-        do_refine = gr.Checkbox(value=False, label="HD refine (img2img)")
-        refine_steps = gr.Slider(5, 40, value=20, step=1, label="Refine steps")
-        refine_strength = gr.Slider(0.1, 0.7, value=0.35, step=0.05, label="Refine strength")
-        refine_cfg = gr.Slider(1.0, 9.0, value=5.5, step=0.5, label="Refine CFG")
-
-    """
-
-
-    """
-    gr.Markdown("## Voice input (Speech → Text)")
-    with gr.Row():
-        mic = gr.Audio(sources=["microphone"], type="filepath", label="Record voice")
-        transcribe_btn = gr.Button("Transcribe → Put into message box")
-    """
-
     def toggle_audio_mode(mode):
         return (
             gr.update(visible=(mode == "stream")),
@@ -882,12 +1284,14 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
         chat_ui = []
         mm_state = []
         user_text_stream = ""
-        out_audio = None
+        out_audio_stream  = None
         user_image = None
         mic_stream = None
         last_audio_state = None
         is_reversed_state = None
-        return chat_ui, mm_state, user_text_stream, out_audio, user_image, mic_stream, last_audio_state, is_reversed_state
+        tts_queue_state = None 
+        playing_until_state = None
+        return chat_ui, mm_state, user_text_stream, out_audio_stream , user_image, mic_stream, last_audio_state, is_reversed_state, tts_queue_state, playing_until_state
     
 
     def _clear():
@@ -899,7 +1303,9 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
         mic = None
         last_audio_state = None
         is_reversed_state = None
-        return chat_ui, msgs_state, user_text, out_audio, user_image, mic, last_audio_state, is_reversed_state
+        tts_queue_state = None
+        playing_until_state = None
+        return chat_ui, msgs_state, user_text, out_audio, user_image, mic, last_audio_state, is_reversed_state, tts_queue_state, playing_until_state
     
 
     def _clear_img():
@@ -911,6 +1317,7 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
     def apply_visibility(mode_val, voice_on):
         is_stream = (mode_val == "stream")
         voice_on = bool(voice_on)
+    
 
         return (
             # textboxes
@@ -928,6 +1335,12 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
             gr.update(visible=not is_stream),    # clear_btn
 
             gr.update(visible=voice_on),         # Mic Mardown Text
+            
+            # audio players 
+            gr.update(visible=not is_stream, value=None),   # out_audio (file)
+            gr.update(visible=is_stream, value=None),       # out_audio_stream (streaming)
+
+            gr.update(value=False),                 # is_reversed_state 
         )
 
 
@@ -949,15 +1362,19 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
 
     send_btn_stream.click(
         fn=chat_step_stream,
-        inputs=[chat_ui, mm_state, user_text_stream, user_image, speak_back, tts_volume, reverse_after, last_audio_state, is_reversed_state],
-        outputs=[chat_ui, mm_state, user_text_stream, out_audio, last_audio_state, is_reversed_state],
+        inputs=[chat_ui, mm_state, user_text_stream, user_image, speak_back, tts_volume, reverse_after, last_audio_state, is_reversed_state, tts_queue_state, playing_until_state],
+        outputs=[chat_ui, mm_state, user_text_stream, out_audio, out_audio_stream, last_audio_state, is_reversed_state, tts_queue_state, playing_until_state],
     )
 
     user_text_stream.submit(
         fn=chat_step_stream,
-        inputs=[chat_ui, mm_state, user_text_stream, user_image, speak_back, tts_volume, reverse_after, last_audio_state, is_reversed_state],
-        outputs=[chat_ui, mm_state, user_text_stream, out_audio, last_audio_state, is_reversed_state],
+        inputs=[chat_ui, mm_state, user_text_stream, user_image, speak_back, tts_volume, reverse_after, last_audio_state, is_reversed_state, tts_queue_state, playing_until_state],
+        outputs=[chat_ui, mm_state, user_text_stream,out_audio, out_audio_stream , last_audio_state, is_reversed_state, tts_queue_state, playing_until_state],
     )
+
+
+
+
 
 
     """
@@ -1012,14 +1429,19 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
             reverse_after,
             last_audio_state,
             is_reversed_state,
+            tts_queue_state, 
+            playing_until_state
         ],
         outputs=[
             chat_ui,
             mm_state,
             user_text_stream,
             out_audio,
+            out_audio_stream ,
             last_audio_state,
-            is_reversed_state
+            is_reversed_state,
+            tts_queue_state, 
+            playing_until_state
         ],
     )
 
@@ -1040,7 +1462,7 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
     clear_btn_stream.click(
         fn=_clear_stream,
         inputs=[],
-        outputs=[chat_ui, mm_state, user_text_stream, out_audio, user_image, mic, last_audio_state, is_reversed_state],
+        outputs=[chat_ui, mm_state, user_text_stream, out_audio_stream , user_image, mic, last_audio_state, is_reversed_state, tts_queue_state, playing_until_state],
     )
 
     clear_btn.click(
@@ -1058,10 +1480,11 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
 
 
     reverse_btn.click(
-        fn=toggle_reverse_audio,
+        fn=toggle_reverse_audio_ui,
         inputs=[last_audio_state, is_reversed_state],
-        outputs=[out_audio, is_reversed_state],
+        outputs=[out_audio, out_audio_stream, is_reversed_state],
     )
+
 
     mode.change(
         fn=apply_visibility,
@@ -1072,6 +1495,9 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
             send_btn_stream, send_btn,
             clear_btn_stream, clear_btn,
             text_markdown_speech,
+            out_audio, out_audio_stream,
+            is_reversed_state,
+        
         ],
     )
 
@@ -1083,7 +1509,8 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
             mic_stream, mic,
             send_btn_stream, send_btn,
             clear_btn_stream, clear_btn,
-            text_markdown_speech,
+            text_markdown_speech
+     
         ],
     )
 
