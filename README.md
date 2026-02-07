@@ -7,12 +7,19 @@ This project focuses on practical multimodal interaction while keeping memory us
 ## Features
 
 💬 Text chat with MiniCPM-V
+
 🖼️ Image understanding (vision + language)
+
 🎤 Speech-to-text (offline, CPU-based Whisper)
+
 🔊 Text-to-speech (offline Piper TTS)
+
 🔁 Audio reversal & volume control
+
 🎨 Optional text-to-image generation (Stable Diffusion Turbo)
+
 ⚡ 12GB-GPU friendly design
+
 🧠 No external APIs required (fully local)
 
 ## Architecture Overview
