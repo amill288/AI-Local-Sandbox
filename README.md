@@ -1,6 +1,6 @@
-# MiniCPM-V Multimodal Chatbot (12GB-Friendly)
+# MiniCPM-o-4.5 Multimodal Chatbot (12GB-Friendly)
 
-A local, GPU-efficient multimodal chatbot built around MiniCPM-V-4.5, supporting text, image understanding, voice input, offline text-to-speech, and optional image generation — all runnable on a single 12GB GPU.
+A local, GPU-efficient multimodal chatbot built around MiniCPM-o-4.5, supporting text, image understanding, voice input, offline text-to-speech, and optional image generation — all runnable on a single 12GB GPU.
 
 This project focuses on practical multimodal interaction while keeping memory usage under control through careful model loading, CPU/GPU separation, and optional components.
 
@@ -8,7 +8,7 @@ This project focuses on practical multimodal interaction while keeping memory us
 
 ## Features
 
-- Text chat with MiniCPM-V
+- Text chat with MiniCPM-o-4.5
 - Image understanding (vision + language)
 - Speech-to-text (offline, CPU-based Whisper)
 - Text-to-speech (offline Piper TTS)
@@ -20,7 +20,7 @@ This project focuses on practical multimodal interaction while keeping memory us
 <br><br>
 
 ## Architecture Overview
-- MiniCPM-V-4.5 (INT4)
+- MiniCPM-o-4.5 (INT4)
   - Runs on GPU via device_map="auto"
 - Speech-to-Text
   - faster-whisper on CPU (keeps GPU free)
@@ -49,6 +49,12 @@ Software
 
 <br><br>
 ## Installation
+
+From Windows CMD:
+```
+wsl --install -d Ubuntu-24.04 --name MiniCPM-demo
+```
+
 
 ```bash
 git clone https://github.com/amill288/MiniCPM-o-4.5_Multimodal-Chatbot.git
