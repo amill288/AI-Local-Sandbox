@@ -115,9 +115,14 @@ python minicpm.py
 ```
 The Gradio interface will launch on:
 ```
+# Enter this in browser:
+
 http://localhost:7860
 ```
 <br><br>
+
+The first run will auto download the required safetensors, after that it will use checkpoints and run more quickly.
+
 
 ## Usage Notes
 - Voice input/output is fully offline
