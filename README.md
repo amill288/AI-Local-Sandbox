@@ -68,6 +68,7 @@ Create a User Name and Password for WSL
 cd ~
 git clone https://github.com/amill288/MiniCPM-o-4.5-Multimodal-Chatbot.git
 mv MiniCPM-o-4.5-Multimodal-Chatbot MiniCPM
+cd MiniCPM
 
 # 1. Create venv
 python -m venv .venv
