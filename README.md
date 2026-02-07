@@ -68,9 +68,12 @@ pip install -r requirements.txt
 
 ```
 
+
+
 You’ll also need:
 - A Piper voice model (ONNX)
 - `piper` available on your PATH
+
 
 ```
 mkdir -p ~/piper_voices/libritts_r_medium
@@ -83,7 +86,9 @@ wget -O en_US-libritts_r-medium.onnx.json \
   https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/libritts_r/medium/en_US-libritts_r-medium.onnx.json
 ```
 
+
 Feel free to switch the wget to a different `piper` voice model.
+
 
 
 
