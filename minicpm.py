@@ -23,6 +23,7 @@ from threading import Thread, Event
 
 # Keep history bounded to avoid VRAM/latency blowups
 MAX_TURNS = 12
+DEFAULT_TOKENS = 240
 
 # If you previously saw fragmentation warnings, this helps:
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -167,7 +168,7 @@ class MiniCPMAgent:
         return [pil, text]
 
     # -------- Core chat (streaming) --------
-    def stream_chat(self, state: MMState, user_text: str, user_image: Optional[Image.Image]):
+    def stream_chat(self, state: MMState, user_text: str, default_tokens, max_turns, user_image: Optional[Image.Image]):
         """
         Yields incremental assistant text chunks.
         """
@@ -196,7 +197,7 @@ class MiniCPMAgent:
 
         # Append user message to model state
         state.msgs.append({"role": "user", "content": mm_content})
-        state.msgs = state.msgs[-(MAX_TURNS * 2):]  # crude bound, keep your existing trim if preferred
+        state.msgs = state.msgs[-(max_turns * 2):]  # crude bound, keep your existing trim if preferred
 
         # STREAMING: model.chat(stream=True) usually yields text fragments for MiniCPM-style repos.
         # If it returns a generator of dicts, we handle that too.
@@ -210,6 +211,7 @@ class MiniCPMAgent:
                 use_tts_template=False,
                 max_slice_nums=1,
                 use_image_id=False,           # keep stable; we do app-level caching
+                max_new_tokens = default_tokens
             )
 
             # Normalize streaming output
@@ -232,7 +234,7 @@ class MiniCPMAgent:
             # Save final assistant message to model state
             if acc.strip():
                 state.msgs.append({"role": "assistant", "content": acc})
-                state.msgs = state.msgs[-(MAX_TURNS * 2):]
+                state.msgs = state.msgs[-(max_turns * 2):]
 
 
 
@@ -609,11 +611,11 @@ def refine_image(img: Image.Image, prompt: str, steps: int = 20, strength: float
 # -----------------------------
 # Chat function 
 # -----------------------------
-def chat_step(chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume_val,reverse_after, last_audio_state,is_reversed_state):
+def chat_step(chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume_val, last_audio_state,is_reversed_state,default_tokens, max_turns):
 
     # normalize inputs (IMPORTANT)
     tts_volume_val = 1.0 if tts_volume_val is None else float(tts_volume_val)
-    reverse_after = bool(reverse_after) if reverse_after is not None else False
+
 
     # -------- Chat UI normalization (Gradio Chatbot) --------
     def _as_messages(x):
@@ -631,7 +633,7 @@ def chat_step(chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume
             return msgs
         return []
 
-    def _trim_history_safe(msgs, max_turns=6):
+    def _trim_history_safe(msgs, max_turns=max_turns):
         # keep last N user turns (+ their assistant replies)
         msgs = msgs or []
         user_idxs = [i for i, m in enumerate(msgs) if m.get("role") == "user"]
@@ -677,7 +679,7 @@ def chat_step(chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume
 
     msgs_state = msgs_state or []
     msgs_state.append({"role": "user", "content": mm_content})
-    msgs_state = _trim_history_safe(msgs_state, max_turns=6)
+    msgs_state = _trim_history_safe(msgs_state, max_turns=max_turns)
 
 
     try:
@@ -691,11 +693,12 @@ def chat_step(chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume
             # These help stability for images:
             max_slice_nums=1,
             use_image_id=False,
+            max_new_tokens=default_tokens
         )
 
         # Update model state
         msgs_state.append({"role": "assistant", "content": response_text})
-        msgs_state = _trim_history_safe(msgs_state, max_turns=6)
+        msgs_state = _trim_history_safe(msgs_state, max_turns=max_turns)
 
         # Update UI chat (messages format)
         chat_ui_msgs = _as_messages(chat_ui)
@@ -714,11 +717,8 @@ def chat_step(chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume
             new_last_audio = normal_path
             new_is_reversed = False
 
-            # OPTIONAL: if you still want "reverse_after" checkbox to play reversed immediately:
-            if reverse_after:
-                audio_path = wav_reverse(normal_path)
-                new_is_reversed = True
 
+        
         return chat_ui_msgs, msgs_state, "", audio_path, new_last_audio, new_is_reversed
 
     
@@ -776,8 +776,9 @@ def chat_step(chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume
 
 
 def chat_step_stream(chat_ui, mm_state: MMState, user_text, user_image,
-                     speak_back, tts_volume_val, reverse_after,
-                     last_audio_state, is_reversed_state, tts_queue_state, playing_until_state):
+                     speak_back, tts_volume_val,
+                     last_audio_state, is_reversed_state, tts_queue_state, 
+                     playing_until_state, default_tokens, max_turns):
     audio_accum = []   # list of np.float32 chunks
  
     
@@ -853,7 +854,7 @@ def chat_step_stream(chat_ui, mm_state: MMState, user_text, user_image,
     partial = ""
     spoken_upto = 0
 
-    for partial in agent.stream_chat(mm_state, user_text=user_text, user_image=pil_img):
+    for partial in agent.stream_chat(mm_state, user_text=user_text, default_tokens = default_tokens , max_turns=max_turns, user_image=pil_img):
         chat_ui_msgs[-1]["content"] = partial
 
         if speak_back and len(partial) > spoken_upto:
@@ -906,6 +907,7 @@ def chat_step_stream(chat_ui, mm_state: MMState, user_text, user_image,
 
             wav_path = item
             out_audio_val = wav_path
+            audio_accum.append(out_audio_val)
             dur = wav_duration_s(wav_path)
             playing_until_state = now + dur + 0.08
             last_audio_state = wav_path
@@ -1031,10 +1033,12 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
     gr.Markdown("## Response Options")
     with gr.Row():
         with gr.Column(scale=0.2):
+            max_tokens = gr.Slider(10, 10000, value=DEFAULT_TOKENS, step=10, label="Max Response Tokens")
+            max_turns = gr.Slider(5, 100, value=MAX_TURNS, step=1, label="Max History Turns")
+        with gr.Column(scale=0.2):
             tts_volume = gr.Slider(0.2, 2.0, value=0.5, step=0.05, label="TTS Volume")
         with gr.Column(scale=0.2):
             speak_back = gr.Checkbox(value=True, label="Speak responses (TTS)")
-            #reverse_after = gr.Checkbox(value=False, label="Play reverse")
         with gr.Column(scale=0.2):
             mode = gr.Radio(
                 choices=["stream", "final"],
@@ -1158,26 +1162,26 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
 
     send_btn.click(
         fn=chat_step,
-        inputs=[chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume, reverse_after, last_audio_state],
+        inputs=[chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume, last_audio_state, max_tokens, max_turns],
         outputs=[chat_ui, msgs_state, user_text, out_audio, last_audio_state, is_reversed_state],
     )
 
     user_text.submit(
         fn=chat_step,
-        inputs=[chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume, reverse_after, last_audio_state],
+        inputs=[chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume, last_audio_state, max_tokens, max_turns],
         outputs=[chat_ui, msgs_state, user_text, out_audio, last_audio_state, is_reversed_state],
     )
     
 
     send_btn_stream.click(
         fn=chat_step_stream,
-        inputs=[chat_ui, mm_state, user_text_stream, user_image, speak_back, tts_volume, reverse_after, last_audio_state, is_reversed_state, tts_queue_state, playing_until_state],
+        inputs=[chat_ui, mm_state, user_text_stream, user_image, speak_back, tts_volume, last_audio_state, is_reversed_state, tts_queue_state, playing_until_state, max_tokens, max_turns],
         outputs=[chat_ui, mm_state, user_text_stream, out_audio, out_audio_stream, last_audio_state, is_reversed_state, tts_queue_state, playing_until_state],
     )
 
     user_text_stream.submit(
         fn=chat_step_stream,
-        inputs=[chat_ui, mm_state, user_text_stream, user_image, speak_back, tts_volume, reverse_after, last_audio_state, is_reversed_state, tts_queue_state, playing_until_state],
+        inputs=[chat_ui, mm_state, user_text_stream, user_image, speak_back, tts_volume, last_audio_state, is_reversed_state, tts_queue_state, playing_until_state, max_tokens, max_turns],
         outputs=[chat_ui, mm_state, user_text_stream,out_audio, out_audio_stream , last_audio_state, is_reversed_state, tts_queue_state, playing_until_state],
     )
 
@@ -1207,7 +1211,6 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
             user_image,
             speak_back,
             tts_volume,
-            reverse_after,
             last_audio_state,
             is_reversed_state,
         ],
@@ -1235,7 +1238,6 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
             user_image,
             speak_back,
             tts_volume,
-            reverse_after,
             last_audio_state,
             is_reversed_state,
             tts_queue_state, 
