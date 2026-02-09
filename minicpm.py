@@ -827,6 +827,8 @@ def chat_step_stream(chat_ui, mm_state: MMState, user_text, user_image,
     if mm_state is None:
         mm_state = MMState()
 
+
+
     if tts_queue_state is None:
         tts_queue_state = TTSWavQueue()
         tts_queue_state.start()
@@ -836,6 +838,10 @@ def chat_step_stream(chat_ui, mm_state: MMState, user_text, user_image,
     playing_until_state = 0.0
     is_reversed_state = False
 
+
+    if not isinstance(mm_state, MMState):
+        mm_state = MMState()
+        
     yield (
         chat_ui_msgs,
         mm_state,
