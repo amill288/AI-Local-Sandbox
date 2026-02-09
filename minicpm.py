@@ -611,7 +611,7 @@ def refine_image(img: Image.Image, prompt: str, steps: int = 20, strength: float
 # -----------------------------
 # Chat function 
 # -----------------------------
-def chat_step(chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume_val, last_audio_state,is_reversed_state,default_tokens, max_turns):
+def chat_step(chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume_val, last_audio_state,is_reversed_state, max_tokens, max_turns):
 
     # normalize inputs (IMPORTANT)
     tts_volume_val = 1.0 if tts_volume_val is None else float(tts_volume_val)
@@ -678,8 +678,16 @@ def chat_step(chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume
         mm_content = user_text
 
     msgs_state = msgs_state or []
-    msgs_state.append({"role": "user", "content": mm_content})
+    max_turns = int(max_turns) if max_turns is not None else 20
+
+    # 1) trim previous history BEFORE adding the new user message
     msgs_state = _trim_history_safe(msgs_state, max_turns=max_turns)
+
+    # 2) add the new user message
+    msgs_state.append({"role": "user", "content": mm_content})
+
+    max_tokens = int(max_tokens) if max_tokens is not None else DEFAULT_TOKENS
+    max_turns  = int(max_turns)  if max_turns  is not None else MAX_TURNS
 
 
     try:
@@ -690,10 +698,10 @@ def chat_step(chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume
             stream=False,
             enable_thinking=False,
             use_tts_template=False,
+            max_new_tokens=max_tokens,
             # These help stability for images:
             max_slice_nums=1,
-            use_image_id=False,
-            max_new_tokens=default_tokens
+            use_image_id=False
         )
 
         # Update model state
@@ -778,7 +786,7 @@ def chat_step(chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume
 def chat_step_stream(chat_ui, mm_state: MMState, user_text, user_image,
                      speak_back, tts_volume_val,
                      last_audio_state, is_reversed_state, tts_queue_state, 
-                     playing_until_state, default_tokens, max_turns):
+                     playing_until_state, max_tokens, max_turns):
     audio_accum = []   # list of np.float32 chunks
  
     
@@ -810,7 +818,7 @@ def chat_step_stream(chat_ui, mm_state: MMState, user_text, user_image,
 
     user_text = (user_text or "").strip()
     if not user_text and pil_img is None:
-        #yield chat_ui_msgs, mm_state, "", None, None, last_audio_state, is_reversed_state, tts_queue_state, playing_until_state
+        yield chat_ui_msgs, mm_state, "", None, None, last_audio_state, is_reversed_state, tts_queue_state, playing_until_state
         return
 
 
@@ -854,7 +862,7 @@ def chat_step_stream(chat_ui, mm_state: MMState, user_text, user_image,
     partial = ""
     spoken_upto = 0
 
-    for partial in agent.stream_chat(mm_state, user_text=user_text, default_tokens = default_tokens , max_turns=max_turns, user_image=pil_img):
+    for partial in agent.stream_chat(mm_state, user_text=user_text, default_tokens = max_tokens , max_turns=max_turns, user_image=pil_img):
         chat_ui_msgs[-1]["content"] = partial
 
         if speak_back and len(partial) > spoken_upto:
@@ -1110,7 +1118,7 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
     def _clear():
         chat_ui = []
         msgs_state = []
-        user_text_ = ""
+        user_text = ""
         out_audio = None
         user_image = None
         mic = None
@@ -1213,6 +1221,8 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
             tts_volume,
             last_audio_state,
             is_reversed_state,
+            max_tokens, 
+            max_turns
         ],
         outputs=[
             chat_ui,
@@ -1241,7 +1251,9 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
             last_audio_state,
             is_reversed_state,
             tts_queue_state, 
-            playing_until_state
+            playing_until_state,
+            max_tokens, 
+            max_turns
         ],
         outputs=[
             chat_ui,
