@@ -115,6 +115,15 @@ Feel free to switch the wget to a different `piper` voice model.
 cd ~/MiniCPM
 python minicpm.py
 ```
+
+## To stream webcam video:
+
+```
+cd ~/MiniCPM
+python webcam_live_gradio.py
+```
+
+
 Enter into a browser window the address the Gradio interface will launch on:
 ```
 http://localhost:7860

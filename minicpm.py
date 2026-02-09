@@ -305,8 +305,6 @@ def clean_for_tts(text: str) -> str:
 
 
 
-
-
 def should_speak(buf: str) -> bool:
     s = (buf or "").strip()
     if len(s) >= 180:
@@ -314,161 +312,6 @@ def should_speak(buf: str) -> bool:
     return s.endswith((".", "!", "?"))
 
 
-
-
-
-
-
-
-def chunk_duration_s(sr, chunk: np.ndarray) -> float:
-    return float(len(chunk)) / float(sr)
-
-
-def wav_iter_chunks(wav_path: str, chunk_frames: int = 4096):
-    """
-    Yield (sr, float32_mono_chunk) from a wav file, chunked for streaming.
-    float32 range [-1, 1]
-    """
-    with wave.open(wav_path, "rb") as wf:
-        sr = wf.getframerate()
-        nchan = wf.getnchannels()
-        sampw = wf.getsampwidth()
-
-        if sampw != 2:
-            raise ValueError(f"Expected 16-bit PCM wav. Got sample_width={sampw}")
-
-        while True:
-            raw = wf.readframes(chunk_frames)
-            if not raw:
-                break
-            audio_i16 = np.frombuffer(raw, dtype=np.int16)
-
-            if nchan > 1:
-                audio_i16 = audio_i16.reshape(-1, nchan).mean(axis=1).astype(np.int16)
-
-            audio_f32 = (audio_i16.astype(np.float32) / 32768.0)
-            yield sr, audio_f32
-         
-
-
-def wait_for_file_stable(path: str, timeout_s: float = 5.0, stable_checks: int = 3, poll_s: float = 0.02):
-    """
-    Wait until file exists and size stops changing for stable_checks polls.
-    """
-    t0 = time.time()
-    last = -1
-    stable = 0
-    while time.time() - t0 < timeout_s:
-        try:
-            sz = os.path.getsize(path)
-        except OSError:
-            time.sleep(poll_s)
-            continue
-
-        if sz > 0 and sz == last:
-            stable += 1
-            if stable >= stable_checks:
-                return True
-        else:
-            stable = 0
-            last = sz
-
-        time.sleep(poll_s)
-    return False
-
-
-
-
-def load_wav_full_as_np(path: str):
-    with wave.open(path, "rb") as wf:
-        sr = wf.getframerate()
-        nchan = wf.getnchannels()
-        sampw = wf.getsampwidth()
-        if sampw != 2:
-            raise ValueError(f"Expected 16-bit PCM wav. Got {sampw}")
-
-        raw = wf.readframes(wf.getnframes())
-        audio = np.frombuffer(raw, dtype=np.int16)
-
-        if nchan > 1:
-            audio = audio.reshape(-1, nchan).mean(axis=1).astype(np.int16)
-
-        audio_f32 = audio.astype(np.float32) / 32768.0
-        return sr, audio_f32
-
-
-
-class TTSAudioStreamer:
-    def __init__(self, chunk_frames: int = 24000):
-        self.chunk_frames = int(chunk_frames)
-        self.job_q = Queue(maxsize=8)
-        self.audio_q = Queue(maxsize=128)
-        self.stop_evt = Event()
-        self.worker = None
-
-    def start(self):
-        if self.worker and self.worker.is_alive():
-            return
-        self.stop_evt.clear()
-        self.worker = Thread(target=self._run, daemon=True)
-        self.worker.start()
-
-    def stop(self):
-        self.stop_evt.set()
-
-    def submit_text(self, text: str, volume: float = 1.0):
-        self.job_q.put({
-            "text": text,
-            "volume": float(volume),
-        })
-
-    def try_get_audio(self):
-        try:
-            return self.audio_q.get_nowait()
-        except Empty:
-            return None
-
-    def _run(self):
-        while not self.stop_evt.is_set():
-            try:
-                job = self.job_q.get(timeout=0.05)
-            except Empty:
-                continue
-
-            text = job["text"].strip()
-            if not text:
-                continue
-
-            volume = job["volume"]
-
-
-            wav_path = tts_to_wav(clean_for_tts(text))
-            wait_for_file_stable(wav_path)
-            
-            sr, audio = load_wav_full_as_np(wav_path)
-
-            chunk_frames = self.chunk_frames
-            i = 0
-            while i < len(audio) and not self.stop_evt.is_set():
-                chunk = audio[i:i+chunk_frames]
-                self.audio_q.put((sr, chunk))
-                i += chunk_frames
-
-
-    
-def save_np_to_wav(audio_f32: np.ndarray, sr: int, path: str | None = None) -> str:
-    audio_f32 = np.clip(audio_f32, -1.0, 1.0)
-    audio_i16 = (audio_f32 * 32767.0).astype(np.int16)
-
-    if path is None:
-        path = f"/tmp/tts_stream_{int(time.time()*1000)}.wav"
-
-    with wave.open(path, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(int(sr))
-        wf.writeframes(audio_i16.tobytes())
-    return path
 
 
 def wav_duration_s(path: str) -> float:
@@ -531,152 +374,6 @@ class TTSWavQueue:
         while True:
             try: self.ready_q.get_nowait()
             except Empty: break
-
-
-
-
-
-
-def concat_wavs(wav_paths, out_path=None):
-    if not wav_paths:
-        return None
-    if out_path is None:
-        out_path = f"/tmp/tts_concat_{int(time.time()*1000)}.wav"
-
-    with wave.open(wav_paths[0], "rb") as w0:
-        params = w0.getparams()
-
-    with wave.open(out_path, "wb") as out:
-        out.setparams(params)
-        for p in wav_paths:
-            with wave.open(p, "rb") as w:
-                # basic safety: ensure compatible format
-                if w.getparams() != params:
-                    raise ValueError("WAV format mismatch; cannot concat safely.")
-                out.writeframes(w.readframes(w.getnframes()))
-    return out_path
-
-
-
-
-
-# -----------------------------
-# OPTIONAL: Image generation (separate model)
-# -----------------------------
-_SD = None
-
-def get_sd_pipeline():
-    """
-    Optional image generator. WARNING: running SD alongside the LLM can be tight on 12GB.
-    We load it on CPU and move to GPU only for generation, then move back.
-    """
-    global _SD
-    if _SD is not None:
-        return _SD
-    if not _try_import_diffusers():
-        return None
-
-    from diffusers import AutoPipelineForText2Image
-
-    # A fast/small-ish option. You can change this to another SD checkpoint.
-    sd_id = "stabilityai/sd-turbo"
-
-    pipe = AutoPipelineForText2Image.from_pretrained(
-        sd_id,
-        torch_dtype=torch.float16,
-        variant="fp16",
-    )
-    pipe = pipe.to("cpu")
-    _SD = pipe
-    return pipe
-
-
-def generate_image(prompt: str, steps: int = 4, width: int = 512, height: int = 512) -> Optional[Image.Image]:
-    pipe = get_sd_pipeline()
-    if pipe is None:
-        return None
-
-    if torch.cuda.is_available():
-        pipe.to("cuda")
-
-    with torch.inference_mode():
-        img = pipe(
-            prompt=prompt,
-            num_inference_steps=int(steps),
-            guidance_scale=0.0,
-            height=int(height),
-            width=int(width),
-        ).images[0]
-
-    pipe.to("cpu")
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    return img
-
-
-
-
-
-
-_SD_REFINE = None
-
-def get_sd_refine_pipeline():
-    global _SD_REFINE
-    if _SD_REFINE is not None:
-        return _SD_REFINE
-    if not _try_import_diffusers():
-        return None
-
-    from diffusers import AutoPipelineForImage2Image
-
-    sd_id = "stabilityai/sd-turbo"  # start simple; can swap later for higher-quality checkpoint
-    pipe = AutoPipelineForImage2Image.from_pretrained(
-        sd_id,
-        torch_dtype=torch.float16,
-        variant="fp16",
-    )
-
-    # helps VRAM a bit
-    try:
-        pipe.enable_attention_slicing()
-    except Exception:
-        pass
-
-    pipe = pipe.to("cpu")
-    _SD_REFINE = pipe
-    return pipe
-
-
-
-
-
-def refine_image(img: Image.Image, prompt: str, steps: int = 20, strength: float = 0.35, guidance: float = 5.5) -> Optional[Image.Image]:
-    pipe = get_sd_refine_pipeline()
-    if pipe is None or img is None:
-        return None
-
-    if torch.cuda.is_available():
-        pipe.to("cuda")
-
-    with torch.inference_mode():
-        out = pipe(
-            prompt=prompt,
-            image=img,
-            num_inference_steps=int(steps),
-            strength=float(strength),
-            guidance_scale=float(guidance),
-        ).images[0]
-
-    pipe.to("cpu")
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    return out
-
-
-
-
 
 
 
@@ -779,6 +476,127 @@ def concat_wavs_flexible(wav_paths, out_path=None):
         wf.writeframes(audio_i16.tobytes())
 
     return out_path
+
+
+
+
+
+
+# -----------------------------
+# OPTIONAL: Image generation (separate model)
+# -----------------------------
+_SD = None
+
+def get_sd_pipeline():
+    """
+    Optional image generator. WARNING: running SD alongside the LLM can be tight on 12GB.
+    We load it on CPU and move to GPU only for generation, then move back.
+    """
+    global _SD
+    if _SD is not None:
+        return _SD
+    if not _try_import_diffusers():
+        return None
+
+    from diffusers import AutoPipelineForText2Image
+
+    # A fast/small-ish option. You can change this to another SD checkpoint.
+    sd_id = "stabilityai/sd-turbo"
+
+    pipe = AutoPipelineForText2Image.from_pretrained(
+        sd_id,
+        torch_dtype=torch.float16,
+        variant="fp16",
+    )
+    pipe = pipe.to("cpu")
+    _SD = pipe
+    return pipe
+
+
+def generate_image(prompt: str, steps: int = 4, width: int = 512, height: int = 512) -> Optional[Image.Image]:
+    pipe = get_sd_pipeline()
+    if pipe is None:
+        return None
+
+    if torch.cuda.is_available():
+        pipe.to("cuda")
+
+    with torch.inference_mode():
+        img = pipe(
+            prompt=prompt,
+            num_inference_steps=int(steps),
+            guidance_scale=0.0,
+            height=int(height),
+            width=int(width),
+        ).images[0]
+
+    pipe.to("cpu")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return img
+
+
+
+
+_SD_REFINE = None
+
+def get_sd_refine_pipeline():
+    global _SD_REFINE
+    if _SD_REFINE is not None:
+        return _SD_REFINE
+    if not _try_import_diffusers():
+        return None
+
+    from diffusers import AutoPipelineForImage2Image
+
+    sd_id = "stabilityai/sd-turbo"  # start simple; can swap later for higher-quality checkpoint
+    pipe = AutoPipelineForImage2Image.from_pretrained(
+        sd_id,
+        torch_dtype=torch.float16,
+        variant="fp16",
+    )
+
+    # helps VRAM a bit
+    try:
+        pipe.enable_attention_slicing()
+    except Exception:
+        pass
+
+    pipe = pipe.to("cpu")
+    _SD_REFINE = pipe
+    return pipe
+
+
+
+
+
+def refine_image(img: Image.Image, prompt: str, steps: int = 20, strength: float = 0.35, guidance: float = 5.5) -> Optional[Image.Image]:
+    pipe = get_sd_refine_pipeline()
+    if pipe is None or img is None:
+        return None
+
+    if torch.cuda.is_available():
+        pipe.to("cuda")
+
+    with torch.inference_mode():
+        out = pipe(
+            prompt=prompt,
+            image=img,
+            num_inference_steps=int(steps),
+            strength=float(strength),
+            guidance_scale=float(guidance),
+        ).images[0]
+
+    pipe.to("cpu")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return out
+
+
+
+
 
 
 
@@ -1129,17 +947,6 @@ def do_generate_image(prompt, steps, width, height, do_refine, refine_steps, ref
     return img
 
 
-def toggle_reverse_audio(last_audio_path, is_reversed):
-    if not last_audio_path:
-        return None, False
-
-    if is_reversed:
-        # go back to normal
-        return last_audio_path, False
-    else:
-        # play reversed
-        rev_path = wav_reverse(last_audio_path)
-        return rev_path, True
 
 def toggle_reverse_audio_ui(last_audio_path, is_reversed):
     if not last_audio_path:
@@ -1159,6 +966,8 @@ def toggle_reverse_audio_ui(last_audio_path, is_reversed):
             gr.update(visible=False),
             True
         )
+
+
 
 # -----------------------------
 # Gradio UI
@@ -1225,7 +1034,7 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
             tts_volume = gr.Slider(0.2, 2.0, value=0.5, step=0.05, label="TTS Volume")
         with gr.Column(scale=0.2):
             speak_back = gr.Checkbox(value=True, label="Speak responses (TTS)")
-            reverse_after = gr.Checkbox(value=False, label="Play reverse")
+            #reverse_after = gr.Checkbox(value=False, label="Play reverse")
         with gr.Column(scale=0.2):
             mode = gr.Radio(
                 choices=["stream", "final"],
