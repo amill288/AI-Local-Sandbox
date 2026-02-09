@@ -1124,9 +1124,7 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
         mic = None
         last_audio_state = None
         is_reversed_state = None
-        tts_queue_state = None
-        playing_until_state = None
-        return chat_ui, msgs_state, user_text, out_audio, user_image, mic, last_audio_state, is_reversed_state, tts_queue_state, playing_until_state
+        return chat_ui, msgs_state, user_text, out_audio, user_image, mic, last_audio_state, is_reversed_state
     
 
     def _clear_img():
@@ -1170,13 +1168,13 @@ with gr.Blocks(title="MiniCPM-o-4.5 Multimodal Chatbot (12GB-friendly)") as demo
 
     send_btn.click(
         fn=chat_step,
-        inputs=[chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume, last_audio_state, max_tokens, max_turns],
+        inputs=[chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume, last_audio_state, is_reversed_state, max_tokens, max_turns],
         outputs=[chat_ui, msgs_state, user_text, out_audio, last_audio_state, is_reversed_state],
     )
 
     user_text.submit(
         fn=chat_step,
-        inputs=[chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume, last_audio_state, max_tokens, max_turns],
+        inputs=[chat_ui, msgs_state, user_text, user_image, speak_back, tts_volume, last_audio_state, is_reversed_state, max_tokens, max_turns],
         outputs=[chat_ui, msgs_state, user_text, out_audio, last_audio_state, is_reversed_state],
     )
     
