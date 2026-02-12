@@ -55,14 +55,14 @@ Software
 #### From Windows CMD:
 _Note: If this hangs, press CTRL+C and rerun._
 ```
-wsl --install -d Ubuntu-24.04 --name MiniCPM-demo
+wsl --install -d Ubuntu-24.04 --name AI-Sandbox
 ```
 
 Create a User Name and Password for WSL
 
 <br>
 
-#### Close CMD and Open MiniCPM-demo
+#### Close CMD and Open AI-Sandbox
 
 <br>
 
